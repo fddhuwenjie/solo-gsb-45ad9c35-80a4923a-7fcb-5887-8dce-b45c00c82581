@@ -15,10 +15,21 @@ Workflow
    picks one of the two labels per sample (``POST .../adjudications``).
    With no disagreements the batch seals immediately on the second
    submission.
-5. Sealing unblinds the batch: results expose per-sample final label, true
+5. Before sealing, the arbiter can name a reviewer seat (1 or 2) and rotate
+   its credential (``POST .../reviewer-replacements``) so a successor can
+   take over after a reviewer drops out or a credential leaks. The new
+   credential appears only in the replacement response; the old credential
+   is invalid immediately and can no longer submit or query that seat. If
+   the seat already held a submission, that whole classification is
+   discarded while the other reviewer's submission is kept; the batch
+   returns to ``collecting`` and the old disagreements/adjudications are
+   erased. The successor submits a fresh independent classification and
+   disagreements/sealing are then computed by exactly the same flow as
+   above. A sealed batch refuses replacement.
+6. Sealing unblinds the batch: results expose per-sample final label, true
    label and each reviewer's correct count. Final rows are written once at
    seal time and never change afterwards.
-6. If a sample's true label turns out to be misrecorded after sealing, the
+7. If a sample's true label turns out to be misrecorded after sealing, the
    arbiter files an erratum (``POST .../errata``) with the expected revision
    number and the corrected labels. Revision 0 is the sealed original; each
    accepted erratum creates the next revision, replacing only the listed
@@ -26,7 +37,7 @@ Workflow
    and reviewer labels but recomputes per-sample correctness and all three
    correct counts against that revision's truth. The plain batch/results
    queries always keep returning the sealed original.
-7. The arbiter can also open an independent re-evaluation of a sealed batch
+8. The arbiter can also open an independent re-evaluation of a sealed batch
    (``POST .../reevaluations``), naming the truth revision to use. The
    service snapshots that revision's sample codes, categories and truth into
    a brand new batch with fresh reviewer and arbiter credentials; the
@@ -98,6 +109,11 @@ class ReevaluationRequest(BaseModel):
     # errata revision of the source whose truth the new round snapshots
     # (0 = the sealed original)
     truth_revision: int
+
+
+class ReviewerReplacementRequest(BaseModel):
+    # the reviewer seat whose credential is rotated: 1 or 2
+    reviewer: int
 
 
 # --------------------------------------------------------------------------
@@ -476,6 +492,72 @@ def logic_own_submission(store: Store, batch_id: str, token: str | None) -> dict
             "submitted": True,
             "submitted_at": sub["submitted_at"],
             "labels": {i["code"]: i["label"] for i in items},
+        }
+
+
+def logic_replace_reviewer(
+    store: Store, batch_id: str, token: str | None, payload: ReviewerReplacementRequest
+) -> dict:
+    """Rotate one reviewer seat's credential before the batch is sealed.
+
+    The arbiter names a seat (1 or 2). Its token hash is replaced, so the
+    old credential can neither submit nor query the seat any more. When the
+    seat already held a submission, that whole classification is discarded
+    while the other reviewer's submission is kept; any stale disagreements
+    and adjudications are erased and the batch goes back to ``collecting``
+    for the successor's fresh submission. Everything happens in one
+    ``BEGIN IMMEDIATE`` transaction, so an interleaved submission, an
+    automatic seal or an arbitration takes effect in a single serialized
+    order, and any validation failure rolls back without leaving a new
+    credential or a partially voided submission behind.
+    """
+    reviewer = payload.reviewer
+    with store.write() as conn:
+        batch = _get_batch(conn, batch_id)
+        _require_arbiter(batch, token)
+        if batch["phase"] == "sealed":
+            raise HTTPException(409, "batch is already sealed; reviewer credentials cannot be replaced")
+        if reviewer not in (1, 2):
+            raise HTTPException(422, "reviewer must be 1 or 2")
+
+        seat_submitted = conn.execute(
+            "SELECT 1 FROM submissions WHERE batch_id = ? AND reviewer = ?",
+            (batch_id, reviewer),
+        ).fetchone()
+        voided_submission = seat_submitted is not None
+        if voided_submission:
+            # Discard the leaving reviewer's whole classification (children
+            # first to satisfy the foreign key); the other seat is untouched.
+            conn.execute(
+                "DELETE FROM submission_items WHERE batch_id = ? AND reviewer = ?",
+                (batch_id, reviewer),
+            )
+            conn.execute(
+                "DELETE FROM submissions WHERE batch_id = ? AND reviewer = ?",
+                (batch_id, reviewer),
+            )
+            # The old disagreements no longer exist: adjudications made
+            # against the voided classification must not survive. They only
+            # exist in 'adjudicating', but deleting unconditionally keeps the
+            # state invariant in either unsealed phase.
+            conn.execute("DELETE FROM adjudications WHERE batch_id = ?", (batch_id,))
+            conn.execute(
+                "UPDATE batches SET phase = 'collecting' WHERE id = ?", (batch_id,)
+            )
+
+        new_token = secrets.token_urlsafe(32)
+        column = f"reviewer{reviewer}_token_hash"
+        conn.execute(
+            f"UPDATE batches SET {column} = ? WHERE id = ?",
+            (_token_hash(new_token), batch_id),
+        )
+        return {
+            "batch_id": batch_id,
+            "reviewer": reviewer,
+            "reviewer_token": new_token,
+            "phase": "collecting",
+            "voided_submission": voided_submission,
+            "notice": "This credential is shown only in this response and cannot be recovered.",
         }
 
 
@@ -909,6 +991,14 @@ def create_app(db_path: str | None = None) -> FastAPI:
         x_reviewer_token: str | None = Header(default=None),
     ):
         return logic_submit(store, batch_id, x_reviewer_token, payload.labels)
+
+    @app.post("/batches/{batch_id}/reviewer-replacements", status_code=201)
+    def replace_reviewer(
+        batch_id: str,
+        payload: ReviewerReplacementRequest,
+        x_arbiter_token: str | None = Header(default=None),
+    ):
+        return logic_replace_reviewer(store, batch_id, x_arbiter_token, payload)
 
     @app.get("/batches/{batch_id}/disagreements")
     def get_disagreements(batch_id: str, x_arbiter_token: str | None = Header(default=None)):
