@@ -100,3 +100,62 @@ curl -sS -X POST "$BASE/batches/$BID/errata" \
   -H "X-Arbiter-Token: $ARB" -H 'Content-Type: application/json' \
   -d '{"expected_revision": 1, "corrections": [{"code": "S03", "true_label": "cat"}]}' | python3 -m json.tool
 curl -sS "$BASE/batches/$NBID/comparison" | python3 -m json.tool
+
+echo "== 19. pre-seal reviewer replacement: a fresh batch, reviewer 1 leaks their credential =="
+RCREATE=$(curl -sS -X POST "$BASE/batches" -H 'Content-Type: application/json' -d '{
+  "allowed_categories": ["cat", "dog", "bird"],
+  "samples": [
+    {"code": "S01", "true_label": "cat"},
+    {"code": "S02", "true_label": "dog"},
+    {"code": "S03", "true_label": "bird"}
+  ]
+}')
+RBID=$(json_get "d['batch_id']" <<<"$RCREATE")
+RR1=$(json_get "d['reviewer1_token']" <<<"$RCREATE")
+RR2=$(json_get "d['reviewer2_token']" <<<"$RCREATE")
+RARB=$(json_get "d['arbiter_token']" <<<"$RCREATE")
+
+echo "== 20. reviewer 1 submits, then the arbiter replaces seat 1 before sealing =="
+curl -sS -X POST "$BASE/batches/$RBID/submissions" \
+  -H "X-Reviewer-Token: $RR1" -H 'Content-Type: application/json' \
+  -d '{"labels": {"S01": "cat", "S02": "dog", "S03": "bird"}}' | python3 -m json.tool
+RREPL=$(curl -sS -X POST "$BASE/batches/$RBID/reviewer-replacements" \
+  -H "X-Arbiter-Token: $RARB" -H 'Content-Type: application/json' \
+  -d '{"reviewer": 1}')
+echo "$RREPL" | python3 -m json.tool
+NRR1=$(json_get "d['replacement_token']" <<<"$RREPL")
+
+echo "== 21. old credential is dead (401); batch is back to collecting =="
+curl -sS -o /dev/null -w 'old token submit -> %{http_code}\n' -X POST "$BASE/batches/$RBID/submissions" \
+  -H "X-Reviewer-Token: $RR1" -H 'Content-Type: application/json' \
+  -d '{"labels": {"S01": "cat", "S02": "dog", "S03": "bird"}}'
+curl -sS "$BASE/batches/$RBID" | python3 -m json.tool
+
+echo "== 22. replacement during adjudication: both submit, then seat 2 is replaced =="
+curl -sS -X POST "$BASE/batches/$RBID/submissions" \
+  -H "X-Reviewer-Token: $NRR1" -H 'Content-Type: application/json' \
+  -d '{"labels": {"S01": "cat", "S02": "dog", "S03": "bird"}}' | python3 -m json.tool
+curl -sS -X POST "$BASE/batches/$RBID/submissions" \
+  -H "X-Reviewer-Token: $RR2" -H 'Content-Type: application/json' \
+  -d '{"labels": {"S01": "cat", "S02": "dog", "S03": "cat"}}' | python3 -m json.tool
+RREPL2=$(curl -sS -X POST "$BASE/batches/$RBID/reviewer-replacements" \
+  -H "X-Arbiter-Token: $RARB" -H 'Content-Type: application/json' \
+  -d '{"reviewer": 2}')
+echo "$RREPL2" | python3 -m json.tool
+NRR2=$(json_get "d['replacement_token']" <<<"$RREPL2")
+echo "-- the old disagreement can no longer be adjudicated --"
+curl -sS -o /dev/null -w 'stale adjudication -> %{http_code}\n' -X POST "$BASE/batches/$RBID/adjudications" \
+  -H "X-Arbiter-Token: $RARB" -H 'Content-Type: application/json' \
+  -d '{"decisions": {"S03": "bird"}}'
+
+echo "== 23. successor submits independently, dispute is re-adjudicated and the batch seals =="
+curl -sS -X POST "$BASE/batches/$RBID/submissions" \
+  -H "X-Reviewer-Token: $NRR2" -H 'Content-Type: application/json' \
+  -d '{"labels": {"S01": "cat", "S02": "dog", "S03": "cat"}}' | python3 -m json.tool
+curl -sS -X POST "$BASE/batches/$RBID/adjudications" \
+  -H "X-Arbiter-Token: $RARB" -H 'Content-Type: application/json' \
+  -d '{"decisions": {"S03": "cat"}}' | python3 -m json.tool
+echo "-- a sealed batch rejects replacement --"
+curl -sS -o /dev/null -w 'post-seal replacement -> %{http_code}\n' -X POST "$BASE/batches/$RBID/reviewer-replacements" \
+  -H "X-Arbiter-Token: $RARB" -H 'Content-Type: application/json' \
+  -d '{"reviewer": 1}'

@@ -37,6 +37,16 @@ Workflow
    and the two rounds' correct totals -- all evaluated against the chosen
    revision's truth. Later errata on the source never change the snapshot or
    the comparison.
+8. Before sealing, the arbiter can replace one reviewer seat
+   (``POST .../reviewer-replacements``): the seat's credential is rotated --
+   the old one stops working immediately and the new one appears only in the
+   response -- and, if that seat had submitted, its whole submission is
+   voided while the other reviewer's submission is kept. The batch goes
+   back to ``collecting`` (pending adjudications are discarded, so the old
+   disagreement can never be ruled); the successor submits independently
+   and disagreements and sealing then run the normal flow. Sealed batches
+   reject replacement and a failed call leaves neither a new credential nor
+   a partially voided submission.
 """
 
 from __future__ import annotations
@@ -80,6 +90,11 @@ class SubmissionRequest(BaseModel):
 class AdjudicationRequest(BaseModel):
     # maps disagreement sample code -> chosen label (one of the two reviewers')
     decisions: dict[str, str]
+
+
+class ReplacementRequest(BaseModel):
+    # which reviewer seat (1 or 2) the arbiter wants to replace
+    reviewer: int
 
 
 class CorrectionItem(BaseModel):
@@ -603,6 +618,72 @@ def logic_adjudicate(store: Store, batch_id: str, token: str | None, decisions: 
         return {"batch_id": batch_id, "status": "sealed", "phase": "sealed"}
 
 
+def logic_replace_reviewer(
+    store: Store, batch_id: str, token: str | None, payload: ReplacementRequest
+) -> dict:
+    """Replace one reviewer seat's credential before the batch is sealed.
+
+    The arbiter names a seat (1 or 2); the old credential for that seat is
+    invalidated immediately and a brand-new credential is returned, shown
+    only in this response. If the seat had already submitted, that whole
+    submission is voided and the batch returns to ``collecting``; any pending
+    adjudications (only possible in ``adjudicating``) are discarded as well,
+    so the old disagreement can never be adjudicated -- the successor must
+    submit independently and disagreements are recomputed by the normal
+    flow. Sealed batches are rejected; every write happens in one
+    ``BEGIN IMMEDIATE`` transaction, so a failure never leaves a new
+    credential or a partially voided submission behind.
+    """
+    if payload.reviewer not in (1, 2):
+        raise HTTPException(422, "reviewer must be 1 or 2")
+    with store.write() as conn:
+        batch = _get_batch(conn, batch_id)
+        _require_arbiter(batch, token)  # reviewer credentials cannot replace a seat
+        if batch["phase"] == "sealed":
+            raise HTTPException(409, "batch is already sealed; reviewer seats cannot be replaced")
+
+        had_submission = conn.execute(
+            "SELECT 1 FROM submissions WHERE batch_id = ? AND reviewer = ?",
+            (batch_id, payload.reviewer),
+        ).fetchone() is not None
+
+        new_token = secrets.token_urlsafe(32)
+        conn.execute(
+            f"UPDATE batches SET reviewer{payload.reviewer}_token_hash = ? WHERE id = ?",
+            (_token_hash(new_token), batch_id),
+        )
+        # Void the replaced seat's full submission, if any. The other
+        # reviewer's submission is left untouched.
+        conn.execute(
+            "DELETE FROM submission_items WHERE batch_id = ? AND reviewer = ?",
+            (batch_id, payload.reviewer),
+        )
+        conn.execute(
+            "DELETE FROM submissions WHERE batch_id = ? AND reviewer = ?",
+            (batch_id, payload.reviewer),
+        )
+        # Pending adjudications belonged to disagreements that no longer
+        # exist as adjudicable items; discard them so the old dispute cannot
+        # keep being ruled once the batch is back to collecting.
+        conn.execute("DELETE FROM adjudications WHERE batch_id = ?", (batch_id,))
+        remaining = conn.execute(
+            "SELECT COUNT(*) AS c FROM submissions WHERE batch_id = ?", (batch_id,)
+        ).fetchone()["c"]
+        # With one seat voided at most one submission can remain; the batch
+        # is always collecting again while the successor works.
+        conn.execute("UPDATE batches SET phase = 'collecting' WHERE id = ?", (batch_id,))
+        return {
+            "batch_id": batch_id,
+            "reviewer": payload.reviewer,
+            "phase": "collecting",
+            "voided_submission": had_submission,
+            "other_reviewer_submitted": remaining == 1,
+            "replacement_token": new_token,
+            "notice": "This credential is shown only in this response and cannot be recovered;"
+            " the previous credential for the seat is now invalid.",
+        }
+
+
 def logic_results(store: Store, batch_id: str) -> dict:
     with store.read() as conn:
         batch = _get_batch(conn, batch_id)
@@ -921,6 +1002,14 @@ def create_app(db_path: str | None = None) -> FastAPI:
         x_arbiter_token: str | None = Header(default=None),
     ):
         return logic_adjudicate(store, batch_id, x_arbiter_token, payload.decisions)
+
+    @app.post("/batches/{batch_id}/reviewer-replacements", status_code=201)
+    def replace_reviewer(
+        batch_id: str,
+        payload: ReplacementRequest,
+        x_arbiter_token: str | None = Header(default=None),
+    ):
+        return logic_replace_reviewer(store, batch_id, x_arbiter_token, payload)
 
     @app.get("/batches/{batch_id}/results")
     def get_results(batch_id: str):
